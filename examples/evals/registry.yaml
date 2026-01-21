@@ -1,0 +1,6 @@
+- eval_id: groundedness.v1
+  score_name: groundedness
+  evaluator: evaluators/groundedness.py
+  environments: [local, ci, prod]
+  owner: platform
+  description: "LLM judge: Check if answer is grounded in provided context/evidence"
