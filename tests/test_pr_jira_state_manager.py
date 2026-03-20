@@ -1,59 +1,101 @@
-from pathlib import Path
+from __future__ import annotations
 
-from runner.pr_jira_state_manager import JiraPrStateManager, JiraTransitionMemoryStore
+from typing import Any
+
+import pytest
+
+from runner.pr_jira_state_manager import (
+    WorkflowResult,
+    handle_pr_opened_workflow,
+)
+
+
+class InMemoryStore:
+    def __init__(self, initial: dict[str, Any] | None = None):
+        self.state = initial or {}
+
+    def load(self) -> dict[str, Any]:
+        return self.state
+
+    def save(self, state: dict[str, Any]) -> None:
+        self.state = state
 
 
 class FakeAtlassianClient:
-    def __init__(self, title_map: dict[str, str | None]):
-        self.title_map = title_map
-        self.find_calls: list[str] = []
-        self.transition_calls: list[str] = []
+    def __init__(self, title_to_issue: dict[str, str | None]):
+        self.title_to_issue = title_to_issue
+        self.transitioned: list[str] = []
 
-    def find_jira_from_pr_title(self, pr_title: str) -> str | None:
-        self.find_calls.append(pr_title)
-        return self.title_map.get(pr_title)
+    def find_jira_issue_key_from_pr_title(self, pr_title: str) -> str | None:
+        return self.title_to_issue.get(pr_title)
 
-    def transition_to_under_review(self, jira_key: str) -> None:
-        self.transition_calls.append(jira_key)
+    def transition_issue_to_under_review(self, issue_key: str) -> None:
+        self.transitioned.append(issue_key)
 
 
-def test_transitions_new_jira_and_persists_state(tmp_path: Path) -> None:
-    store = JiraTransitionMemoryStore(tmp_path / "jira_state.json")
-    client = FakeAtlassianClient({"Refactor checkout flow": "PAY-123"})
-    manager = JiraPrStateManager(client, store)
-
-    decision = manager.handle_pr_raised(pr_number=10, pr_title="Refactor checkout flow")
-
-    assert decision.action == "transitioned"
-    assert decision.jira_key == "PAY-123"
-    assert client.transition_calls == ["PAY-123"]
-    assert client.find_calls == ["Refactor checkout flow"]
-    assert store.has_jira("PAY-123")
+def _event(pr_number: int, pr_title: str) -> dict[str, Any]:
+    return {"pull_request": {"number": pr_number, "title": pr_title}}
 
 
-def test_duplicate_jira_does_not_transition_again(tmp_path: Path) -> None:
-    store = JiraTransitionMemoryStore(tmp_path / "jira_state.json")
+def test_first_pr_for_jira_transitions_and_persists() -> None:
+    store = InMemoryStore()
+    client = FakeAtlassianClient({"INC-1001 add review endpoint": "INC-1001"})
+
+    result = handle_pr_opened_workflow(
+        event_payload=_event(42, "INC-1001 add review endpoint"),
+        atlassian_client=client,
+        memory_store=store,
+    )
+
+    assert isinstance(result, WorkflowResult)
+    assert result.transitioned is True
+    assert result.jira_issue_key == "INC-1001"
+    assert client.transitioned == ["INC-1001"]
+    assert store.state == {
+        "transitioned_jira_issues": {"INC-1001": {"pr_numbers": [42]}},
+    }
+
+
+def test_second_pr_for_same_jira_skips_transition_but_tracks_pr_number() -> None:
+    store = InMemoryStore({"transitioned_jira_issues": {"INC-1001": {"pr_numbers": [42]}}})
+    client = FakeAtlassianClient({"INC-1001 follow-up fixes": "INC-1001"})
+
+    result = handle_pr_opened_workflow(
+        event_payload=_event(43, "INC-1001 follow-up fixes"),
+        atlassian_client=client,
+        memory_store=store,
+    )
+
+    assert result.transitioned is False
+    assert result.skipped_reason == "jira_already_transitioned"
+    assert client.transitioned == []
+    assert store.state["transitioned_jira_issues"]["INC-1001"]["pr_numbers"] == [42, 43]
+
+
+def test_no_jira_found_skips_without_state_change() -> None:
+    initial = {"transitioned_jira_issues": {"INC-1001": {"pr_numbers": [42]}}}
+    store = InMemoryStore(initial.copy())
+    client = FakeAtlassianClient({"chore: bump deps": None})
+
+    result = handle_pr_opened_workflow(
+        event_payload=_event(44, "chore: bump deps"),
+        atlassian_client=client,
+        memory_store=store,
+    )
+
+    assert result.transitioned is False
+    assert result.jira_issue_key is None
+    assert result.skipped_reason == "no_jira_found_from_title"
+    assert client.transitioned == []
+    assert store.state == initial
+
+
+def test_missing_pr_number_raises_value_error() -> None:
+    store = InMemoryStore()
     client = FakeAtlassianClient({})
-    manager = JiraPrStateManager(client, store)
-
-    first = manager.handle_pr_raised(pr_number=21, pr_title="PLAT-404 initial work")
-    second = manager.handle_pr_raised(pr_number=22, pr_title="PLAT-404 follow-up")
-
-    assert first.action == "transitioned"
-    assert second.action == "skipped_existing"
-    assert first.jira_key == "PLAT-404"
-    assert second.jira_key == "PLAT-404"
-    assert client.transition_calls == ["PLAT-404"]
-
-
-def test_no_jira_match_is_noop(tmp_path: Path) -> None:
-    store = JiraTransitionMemoryStore(tmp_path / "jira_state.json")
-    client = FakeAtlassianClient({"No ticket in title": None})
-    manager = JiraPrStateManager(client, store)
-
-    decision = manager.handle_pr_raised(pr_number=31, pr_title="No ticket in title")
-
-    assert decision.action == "no_jira_found"
-    assert decision.jira_key is None
-    assert client.transition_calls == []
-    assert client.find_calls == ["No ticket in title"]
+    with pytest.raises(ValueError, match="Missing PR number"):
+        handle_pr_opened_workflow(
+            event_payload={"pull_request": {"title": "INC-1001 add review endpoint"}},
+            atlassian_client=client,
+            memory_store=store,
+        )
