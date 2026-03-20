@@ -1,121 +1,182 @@
-"""PR to Jira state management with deduplicated transitions."""
+"""PR to Jira state management workflow utilities.
+
+This module is designed for automation flows where a new pull request should:
+1. resolve a Jira issue from the PR title (via Atlassian search), and
+2. transition that Jira issue to "Under Review" exactly once.
+
+The idempotency rule is Jira-centric:
+- if a Jira issue has already been transitioned by this workflow,
+  future PRs mapping to the same Jira issue will be tracked but skipped.
+"""
 
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Protocol
-
-JIRA_KEY_PATTERN = re.compile(r"\b([A-Z][A-Z0-9]+-\d+)\b")
+from typing import Any, Protocol
 
 
-class AtlassianJiraClient(Protocol):
-    """Interface for Jira operations backed by Atlassian MCP calls."""
+class AtlassianWorkflowClient(Protocol):
+    """Minimal Atlassian operations required by the workflow."""
 
-    def find_jira_from_pr_title(self, pr_title: str) -> str | None:
-        """Return Jira key for a PR title, or None if no match is found."""
+    def find_jira_issue_key_from_pr_title(self, pr_title: str) -> str | None:
+        """Return Jira issue key associated with the PR title."""
 
-    def transition_to_under_review(self, jira_key: str) -> None:
-        """Move Jira issue into the Under Review state."""
+    def transition_issue_to_under_review(self, issue_key: str) -> None:
+        """Move a Jira issue to the Under Review state."""
+
+
+class WorkflowMemoryStore(Protocol):
+    """Storage interface for maintaining Jira transition state."""
+
+    def load(self) -> dict[str, Any]:
+        """Load the persisted state map."""
+
+    def save(self, state: dict[str, Any]) -> None:
+        """Persist the state map."""
 
 
 @dataclass(frozen=True)
-class TransitionDecision:
-    """Outcome of processing a pull request event."""
+class WorkflowResult:
+    """Outcome details for one PR workflow execution."""
 
-    action: Literal["transitioned", "skipped_existing", "no_jira_found"]
-    jira_key: str | None = None
+    pr_number: int
+    pr_title: str
+    jira_issue_key: str | None
+    transitioned: bool
+    skipped_reason: str | None = None
 
 
-class JiraTransitionMemoryStore:
-    """Persistent deduplication store for Jira transition state."""
+class JsonFileMemoryStore:
+    """Simple JSON-backed memory store for workflow state."""
 
     def __init__(self, path: str | Path):
-        self.path = Path(path)
+        self._path = Path(path)
 
-    @staticmethod
-    def _default_state() -> dict[str, dict[str, dict[str, int]]]:
-        return {"jira_keys": {}}
+    def load(self) -> dict[str, Any]:
+        if not self._path.exists():
+            return {}
+        raw = self._path.read_text(encoding="utf-8")
+        if not raw.strip():
+            return {}
+        return json.loads(raw)
 
-    def _read_state(self) -> dict[str, dict[str, dict[str, int]]]:
-        if not self.path.exists():
-            return self._default_state()
-
-        try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return self._default_state()
-
-        jira_keys = raw.get("jira_keys", {})
-        if not isinstance(jira_keys, dict):
-            return self._default_state()
-
-        return {"jira_keys": jira_keys}
-
-    def _write_state(self, state: dict[str, dict[str, dict[str, int]]]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
-
-    def has_jira(self, jira_key: str) -> bool:
-        state = self._read_state()
-        return jira_key in state["jira_keys"]
-
-    def remember_jira(self, jira_key: str, pr_number: int) -> None:
-        state = self._read_state()
-        existing = state["jira_keys"].get(jira_key)
-
-        if existing is None:
-            state["jira_keys"][jira_key] = {
-                "first_pr_number": pr_number,
-                "latest_pr_number": pr_number,
-            }
-        else:
-            existing["latest_pr_number"] = pr_number
-
-        self._write_state(state)
+    def save(self, state: dict[str, Any]) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
 
 
-def extract_jira_key(text: str) -> str | None:
-    """Extract Jira key from text such as a PR title."""
-    match = JIRA_KEY_PATTERN.search(text.upper())
-    if not match:
-        return None
-    return match.group(1)
+def _extract_pr_number(event: dict[str, Any]) -> int:
+    pull_request = event.get("pull_request")
+    if isinstance(pull_request, dict) and isinstance(pull_request.get("number"), int):
+        return pull_request["number"]
+    if isinstance(event.get("number"), int):
+        return event["number"]
+    raise ValueError("Missing PR number in event payload.")
+
+
+def _extract_pr_title(event: dict[str, Any]) -> str:
+    pull_request = event.get("pull_request")
+    if isinstance(pull_request, dict) and isinstance(pull_request.get("title"), str):
+        title = pull_request["title"].strip()
+        if title:
+            return title
+    if isinstance(event.get("title"), str):
+        title = event["title"].strip()
+        if title:
+            return title
+    raise ValueError("Missing PR title in event payload.")
+
+
+def _normalize_state(state: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(state, dict):
+        state = {}
+
+    transitioned = state.get("transitioned_jira_issues")
+    if not isinstance(transitioned, dict):
+        transitioned = {}
+        state["transitioned_jira_issues"] = transitioned
+
+    return state
+
+
+def handle_pr_opened_workflow(
+    event_payload: dict[str, Any],
+    atlassian_client: AtlassianWorkflowClient,
+    memory_store: WorkflowMemoryStore,
+) -> WorkflowResult:
+    """Process a PR-opened event and transition corresponding Jira issue.
+
+    The workflow is idempotent per Jira issue key:
+    - First PR for issue -> transition to Under Review and persist state.
+    - Subsequent PRs for same issue -> do not transition again.
+    """
+    pr_number = _extract_pr_number(event_payload)
+    pr_title = _extract_pr_title(event_payload)
+
+    jira_issue_key = atlassian_client.find_jira_issue_key_from_pr_title(pr_title)
+    if jira_issue_key is None:
+        return WorkflowResult(
+            pr_number=pr_number,
+            pr_title=pr_title,
+            jira_issue_key=None,
+            transitioned=False,
+            skipped_reason="no_jira_found_from_title",
+        )
+
+    issue_key = jira_issue_key.upper().strip()
+    state = _normalize_state(memory_store.load())
+    transitioned_jira_issues: dict[str, Any] = state["transitioned_jira_issues"]
+
+    if issue_key in transitioned_jira_issues:
+        entry = transitioned_jira_issues[issue_key]
+        if not isinstance(entry, dict):
+            entry = {}
+            transitioned_jira_issues[issue_key] = entry
+        existing_prs = entry.get("pr_numbers")
+        if not isinstance(existing_prs, list):
+            existing_prs = []
+            entry["pr_numbers"] = existing_prs
+        if pr_number not in existing_prs:
+            existing_prs.append(pr_number)
+        memory_store.save(state)
+        return WorkflowResult(
+            pr_number=pr_number,
+            pr_title=pr_title,
+            jira_issue_key=issue_key,
+            transitioned=False,
+            skipped_reason="jira_already_transitioned",
+        )
+
+    atlassian_client.transition_issue_to_under_review(issue_key)
+    transitioned_jira_issues[issue_key] = {"pr_numbers": [pr_number]}
+    memory_store.save(state)
+
+    return WorkflowResult(
+        pr_number=pr_number,
+        pr_title=pr_title,
+        jira_issue_key=issue_key,
+        transitioned=True,
+    )
+
+
+# Backward-compatible API aliases used by existing imports/tests.
+AtlassianJiraClient = AtlassianWorkflowClient
+TransitionDecision = WorkflowResult
+JiraTransitionMemoryStore = JsonFileMemoryStore
 
 
 class JiraPrStateManager:
-    """Coordinates PR events with Jira transitions and memory state."""
+    """OO wrapper around ``handle_pr_opened_workflow``."""
 
-    def __init__(self, atlassian_client: AtlassianJiraClient, memory_store: JiraTransitionMemoryStore):
+    def __init__(self, atlassian_client: AtlassianWorkflowClient, memory_store: WorkflowMemoryStore):
         self.atlassian_client = atlassian_client
         self.memory_store = memory_store
 
-    def _resolve_jira_key(self, pr_title: str) -> str | None:
-        title_key = extract_jira_key(pr_title)
-        if title_key:
-            return title_key
-
-        return self.atlassian_client.find_jira_from_pr_title(pr_title)
-
     def handle_pr_raised(self, pr_number: int, pr_title: str) -> TransitionDecision:
-        """
-        Handle a PR-raised event.
-
-        Behavior:
-        - Resolve Jira from PR title (direct key extraction first, then Atlassian search).
-        - If Jira was already transitioned previously, skip.
-        - Otherwise, move Jira to Under Review and persist memory.
-        """
-        jira_key = self._resolve_jira_key(pr_title)
-        if not jira_key:
-            return TransitionDecision(action="no_jira_found")
-
-        if self.memory_store.has_jira(jira_key):
-            self.memory_store.remember_jira(jira_key, pr_number)
-            return TransitionDecision(action="skipped_existing", jira_key=jira_key)
-
-        self.atlassian_client.transition_to_under_review(jira_key)
-        self.memory_store.remember_jira(jira_key, pr_number)
-        return TransitionDecision(action="transitioned", jira_key=jira_key)
+        return handle_pr_opened_workflow(
+            event_payload={"pull_request": {"number": pr_number, "title": pr_title}},
+            atlassian_client=self.atlassian_client,
+            memory_store=self.memory_store,
+        )
