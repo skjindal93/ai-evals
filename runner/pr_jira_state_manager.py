@@ -126,9 +126,6 @@ def handle_pr_opened_workflow(
     pr_number = _extract_pr_number(event_payload)
     pr_title = _extract_pr_title(event_payload)
 
-    state = memory_store.read_state()
-    transitioned_jira_issues = _ensure_memory_shape(state)
-
     jira_key = atlassian_client.find_jira_issue_key_from_pr_title(pr_title)
     if jira_key is None:
         return TransitionDecision(
@@ -150,6 +147,9 @@ def handle_pr_opened_workflow(
             transitioned=False,
             reason="No Jira key found from PR title",
         )
+
+    state = memory_store.read_state()
+    transitioned_jira_issues = _ensure_memory_shape(state)
 
     existing = transitioned_jira_issues.get(jira_key)
     if isinstance(existing, dict):
