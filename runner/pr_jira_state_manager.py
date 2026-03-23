@@ -121,7 +121,7 @@ def handle_pr_opened_workflow(
     pr_title = _extract_pr_title(event_payload)
 
     jira_issue_key = atlassian_client.find_jira_issue_key_from_pr_title(pr_title)
-    if jira_issue_key is None:
+    if not isinstance(jira_issue_key, str) or not jira_issue_key.strip():
         return WorkflowResult(
             pr_number=pr_number,
             pr_title=pr_title,

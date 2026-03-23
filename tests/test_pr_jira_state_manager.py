@@ -99,3 +99,20 @@ def test_missing_pr_number_raises_value_error() -> None:
             atlassian_client=client,
             memory_store=store,
         )
+
+
+def test_blank_jira_key_from_lookup_skips_without_transition() -> None:
+    store = InMemoryStore()
+    client = FakeAtlassianClient({"INC-1001 malformed mapping": "   "})
+
+    result = handle_pr_opened_workflow(
+        event_payload=_event(45, "INC-1001 malformed mapping"),
+        atlassian_client=client,
+        memory_store=store,
+    )
+
+    assert result.transitioned is False
+    assert result.jira_issue_key is None
+    assert result.skipped_reason == "no_jira_found_from_title"
+    assert client.transitioned == []
+    assert store.state == {}
