@@ -6,6 +6,7 @@ import pytest
 
 from runner.pr_jira_state_manager import (
     PrJiraWorkflowResult,
+    JsonFileMemoryStore,
     handle_pr_opened_workflow,
 )
 
@@ -159,3 +160,14 @@ def test_invalid_pr_number_raises() -> None:
             atlassian_client=client,
             memory_store=memory,
         )
+
+
+def test_json_file_memory_store_default_state_is_isolated(tmp_path) -> None:
+    first = JsonFileMemoryStore(tmp_path / "one.json")
+    second = JsonFileMemoryStore(tmp_path / "two.json")
+
+    first_state = first.load_state()
+    second_state = second.load_state()
+
+    first_state["transitioned_jira_issues"]["AIPLAT-125"] = {"pr_numbers": [1]}
+    assert second_state["transitioned_jira_issues"] == {}

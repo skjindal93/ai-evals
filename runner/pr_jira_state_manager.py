@@ -18,7 +18,9 @@ from pathlib import Path
 from typing import Any, Protocol
 
 
-DEFAULT_MEMORY_STATE: dict[str, Any] = {"transitioned_jira_issues": {}}
+def _empty_memory_state() -> dict[str, Any]:
+    """Return a fresh default memory state object."""
+    return {"transitioned_jira_issues": {}}
 
 
 class AtlassianClient(Protocol):
@@ -49,15 +51,15 @@ class JsonFileMemoryStore:
 
     def load_state(self) -> dict[str, Any]:
         if not self.path.exists():
-            return dict(DEFAULT_MEMORY_STATE)
+            return _empty_memory_state()
 
         raw = self.path.read_text(encoding="utf-8").strip()
         if not raw:
-            return dict(DEFAULT_MEMORY_STATE)
+            return _empty_memory_state()
 
         parsed = json.loads(raw)
         if not isinstance(parsed, dict):
-            return dict(DEFAULT_MEMORY_STATE)
+            return _empty_memory_state()
 
         transitioned = parsed.get("transitioned_jira_issues")
         if not isinstance(transitioned, dict):
