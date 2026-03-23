@@ -70,9 +70,13 @@ class JsonFileMemoryStore:
 def _extract_pr_number(event: dict[str, Any]) -> int:
     pull_request = event.get("pull_request")
     if isinstance(pull_request, dict) and isinstance(pull_request.get("number"), int):
-        return pull_request["number"]
+        pr_number = pull_request["number"]
+        if pr_number > 0:
+            return pr_number
     if isinstance(event.get("number"), int):
-        return event["number"]
+        pr_number = event["number"]
+        if pr_number > 0:
+            return pr_number
     raise ValueError("Missing PR number in event payload.")
 
 
@@ -125,7 +129,24 @@ def handle_pr_opened_workflow(
             skipped_reason="no_jira_found_from_title",
         )
 
+    if not isinstance(jira_issue_key, str):
+        return WorkflowResult(
+            pr_number=pr_number,
+            pr_title=pr_title,
+            jira_issue_key=None,
+            transitioned=False,
+            skipped_reason="no_jira_found_from_title",
+        )
+
     issue_key = jira_issue_key.upper().strip()
+    if not issue_key:
+        return WorkflowResult(
+            pr_number=pr_number,
+            pr_title=pr_title,
+            jira_issue_key=None,
+            transitioned=False,
+            skipped_reason="no_jira_found_from_title",
+        )
     state = _normalize_state(memory_store.load())
     transitioned_jira_issues: dict[str, Any] = state["transitioned_jira_issues"]
 
