@@ -99,3 +99,32 @@ def test_missing_pr_number_raises_value_error() -> None:
             atlassian_client=client,
             memory_store=store,
         )
+
+
+def test_non_positive_pr_number_raises_value_error() -> None:
+    store = InMemoryStore()
+    client = FakeAtlassianClient({"INC-1001 add review endpoint": "INC-1001"})
+    with pytest.raises(ValueError, match="Missing PR number"):
+        handle_pr_opened_workflow(
+            event_payload={"pull_request": {"number": 0, "title": "INC-1001 add review endpoint"}},
+            atlassian_client=client,
+            memory_store=store,
+        )
+
+
+def test_blank_jira_key_from_title_is_treated_as_no_match() -> None:
+    initial = {"transitioned_jira_issues": {"INC-1001": {"pr_numbers": [42]}}}
+    store = InMemoryStore(initial.copy())
+    client = FakeAtlassianClient({"chore: bump deps": "   "})
+
+    result = handle_pr_opened_workflow(
+        event_payload=_event(44, "chore: bump deps"),
+        atlassian_client=client,
+        memory_store=store,
+    )
+
+    assert result.transitioned is False
+    assert result.jira_issue_key is None
+    assert result.skipped_reason == "no_jira_found_from_title"
+    assert client.transitioned == []
+    assert store.state == initial
